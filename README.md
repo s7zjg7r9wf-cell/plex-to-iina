@@ -36,9 +36,12 @@ your own server (`http://<server>:32400/web`).
   resolution and bitrate. Playback resumes from your Plex watch position.
 - **Progress syncs back to Plex** (with the IINA plugin): Continue Watching, resume points,
   watched status and the server dashboard's Now Playing.
-- **Starts on the right tracks.** The best audio track in the language Plex picked
-  (lossless TrueHD or DTS-HD MA first, then the most channels), and Plex's subtitle
-  choice, so you rarely need to switch tracks in IINA.
+- **Starts on the right tracks.** Audio in the first of your languages that the file
+  has, and within it the best track (lossless TrueHD or DTS-HD MA first, then the most
+  channels). If another language has clearly better audio, the message after pressing
+  Play says so. Subtitles follow Plex; if the audio isn't in one of your languages and
+  Plex picked none, the best subtitles in your language come on. So you rarely need to
+  switch tracks in IINA.
 - **Large read-ahead buffer** (1, 2 or 5 GB) that rides out network hiccups on
   high-bitrate files, with instant rewinds.
 - Music, photos and anything it can't resolve still play in Plex. **Option-click** Play
@@ -119,7 +122,9 @@ The toolbar popup has:
 |---|---|
 | Open Play in IINA | Turns the extension on or off. |
 | Resume where Plex left off | Starts at your Plex watch position. |
-| Start with the best audio track | Picks the lossless or highest-channel track in the language Plex chose; subtitles follow Plex. Off: use Plex's audio choice. |
+| Best audio in your languages | Picks audio in the first of your languages that the file has, then the lossless or highest-channel track in it, and notes clearly better audio in other languages. Off: use Plex's audio choice. |
+| Subtitles for other languages | When the audio isn't in one of your languages and Plex picked no subtitles, turns on the best subtitles in your language: full before forced-only, regular before SDH. Otherwise subtitles follow Plex. |
+| Your languages | Your languages in order of preference, like `English, Dutch` (names or codes), for audio and subtitles. Empty: your browser's languages. |
 | Open full screen | Opens IINA in full screen. |
 | Buffer size | How much of the file IINA reads ahead, kept in memory: 1, 2 or 5 GB (default 5). |
 
@@ -250,6 +255,9 @@ messages.
 
 ## Known limits
 
+- Automatic subtitles only use subtitle tracks inside the video file. Separate subtitle
+  files next to it (`.srt` sidecars) can't be passed to IINA this way; pick them in Plex
+  first, or load them in IINA.
 - Switching the audio or subtitle track in IINA makes it download its buffer again
   (mpv discards the buffer on a track switch). Playback resumes after 2 seconds, but on a
   slow connection the buffer takes a while to refill. The extension picks the tracks

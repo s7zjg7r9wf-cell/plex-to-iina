@@ -20,6 +20,8 @@
 
   // Safari (and Firefox) expose the promise-based `browser` namespace; Chrome has `chrome`.
   const ext = globalThis.browser ?? globalThis.chrome;
+  // languages.js, loaded before this script.
+  const LANGUAGES = globalThis.PlexToIinaLanguages;
 
   // Safari: background.js shows an "on" badge for this tab and forwards these notes to
   // the companion app's log (Console.app, subsystem local.plex-to-iina.app.Extension).
@@ -32,7 +34,11 @@
   note('hello', location.host);
 
   const BUFFER_SIZES = [1, 2, 5]; // GB, offered in the popup
-  const DEFAULTS = { enabled: true, resume: true, fullScreen: false, bufferGB: 5, bestAudio: true };
+  const DEFAULTS = {
+    enabled: true, resume: true, fullScreen: false, bufferGB: 5, bestAudio: true,
+    // Subtitles when the audio isn't in one of your languages; empty list = browser's.
+    autoSubtitles: true, myLanguages: '',
+  };
   let settings = { ...DEFAULTS };
   ext.storage.sync.get(DEFAULTS).then((stored) => { settings = stored; });
   ext.storage.onChanged.addListener((changes, area) => {
@@ -104,9 +110,17 @@
         handBack(button, null);
         return;
       }
-      note('log', `Found ${video.title} (${video.quality}) on ${new URL(server.uri).host}${server.relay ? ' via relay' : ''}`);
+      const { autoSubtitle, betterAudio, audio } = video.tracks;
+      const languageOf = (stream) => LANGUAGES.displayName(LANGUAGES.ofStream(stream) ?? 'und');
+      const notes = [
+        autoSubtitle && `${languageOf(autoSubtitle)} subtitles on: the audio is ${languageOf(audio)}`,
+        betterAudio && `Better audio in ${languageOf(betterAudio)}: ${audioLabel(betterAudio)}. Switch in IINA's Audio menu (it reloads the buffer).`,
+        server.relay && '⚠ Via Plex Relay: bandwidth is limited',
+      ].filter(Boolean);
+      note('log', `Found ${video.title} (${video.quality}) on ${new URL(server.uri).host}${notes.map((n) => `; ${n}`).join('')}`);
       await openExternal(iinaUrl(server, video));
-      toast(`▶ ${video.title} in IINA\n${video.quality}${server.relay ? '\n⚠ Via Plex Relay: bandwidth is limited' : ''}`);
+      // Keep a note about other audio up long enough to read.
+      toast([`▶ ${video.title} in IINA`, video.quality, ...notes].join('\n'), { long: Boolean(betterAudio) });
     } catch (err) {
       console.warn('[Plex → IINA]', err);
       note('log', `Failed: ${err.message}`);
@@ -251,9 +265,13 @@
 
   // Choose the audio and subtitle tracks before IINA starts, because switching tracks
   // during playback makes mpv throw away its whole buffer and download it again.
-  // Audio: the best track in the language Plex picked (lossless first, then the most
-  // channels), unless Plex picked a commentary track. Subtitles: whatever Plex picked.
-  // mpv numbers tracks of each type from 1 in file order, which is Plex's `index` order.
+  // Audio: the first of your languages that has an audio track (otherwise the language
+  // Plex picked), and within it the best track: lossless first, then the most channels.
+  // A commentary track Plex picked is kept. If a clearly better track exists in another
+  // language, it's noted so you can switch. Subtitles: whatever Plex picked; if Plex
+  // picked none and the audio isn't in one of your languages, the best subtitles in your
+  // language. mpv numbers tracks of each type from 1 in file order, which is Plex's
+  // `index` order.
   function pickTracks(streams) {
     if (!streams.length) return {}; // nothing known: let IINA choose
     const byIndex = (a, b) => a.index - b.index;
@@ -265,19 +283,52 @@
     if (plexAudio) {
       let chosen = plexAudio;
       if (settings.bestAudio && !isCommentary(plexAudio)) {
-        chosen = audio
-          .filter((s) => s.languageCode === plexAudio.languageCode && !isCommentary(s))
-          .reduce((best, s) => (audioScore(s) > audioScore(best) ? s : best), plexAudio);
+        const main = audio.filter((s) => !isCommentary(s));
+        const language = LANGUAGES.parse(settings.myLanguages)
+          .find((code) => main.some((s) => LANGUAGES.ofStream(s) === code))
+          ?? LANGUAGES.ofStream(plexAudio);
+        const inLanguage = main.filter((s) => LANGUAGES.ofStream(s) === language);
+        chosen = bestAudio(inLanguage.length ? inLanguage : [plexAudio], plexAudio);
+        const overall = bestAudio(main, chosen);
+        if (isClearlyBetter(overall, chosen)) tracks.betterAudio = overall;
       }
       tracks.aid = audio.indexOf(chosen) + 1;
       tracks.audio = chosen;
     }
 
     const plexSubtitle = streams.find((s) => s.streamType === 3 && s.selected);
-    if (!plexSubtitle) tracks.sid = 'no';
-    else if (subtitles.includes(plexSubtitle)) tracks.sid = subtitles.indexOf(plexSubtitle) + 1;
-    // A separate subtitle file (no index) isn't inside the video; leave that to IINA.
+    if (plexSubtitle) {
+      // A separate subtitle file (no index) isn't inside the video; leave that to IINA.
+      if (subtitles.includes(plexSubtitle)) tracks.sid = subtitles.indexOf(plexSubtitle) + 1;
+    } else {
+      const subtitle = settings.autoSubtitles ? subtitlesForForeignAudio(tracks.audio, subtitles) : null;
+      tracks.sid = subtitle ? subtitles.indexOf(subtitle) + 1 : 'no';
+      if (subtitle) tracks.autoSubtitle = subtitle;
+    }
     return tracks;
+  }
+
+  // When the audio isn't in one of your languages: the best subtitles in the first of your
+  // languages that has any. Full subtitles before forced-only ones (which translate just
+  // signs and the odd line), regular before SDH, then the file's default.
+  function subtitlesForForeignAudio(audio, subtitles) {
+    const audioLanguage = LANGUAGES.ofStream(audio);
+    const mine = LANGUAGES.parse(settings.myLanguages);
+    if (!audioLanguage || mine.includes(audioLanguage)) return null;
+    for (const language of mine) {
+      const candidates = subtitles.filter((s) => LANGUAGES.ofStream(s) === language);
+      if (candidates.length) {
+        return candidates.reduce((best, s) => (subtitleScore(s) > subtitleScore(best) ? s : best));
+      }
+    }
+    return null;
+  }
+
+  function subtitleScore(stream) {
+    const label = `${stream.title ?? ''} ${stream.displayTitle ?? ''}`;
+    const forced = stream.forced || /\bforced\b/i.test(label);
+    const sdh = stream.hearingImpaired || /\b(sdh|cc)\b/i.test(label);
+    return (forced ? 0 : 4) + (sdh ? 0 : 2) + (stream.default ? 1 : 0);
   }
 
   function isCommentary(stream) {
@@ -292,6 +343,20 @@
 
   function audioScore(stream) {
     return (isLossless(stream) ? 1e6 : 0) + (stream.channels ?? 0) * 1e4 + (stream.bitrate ?? 0) / 100;
+  }
+
+  // The highest-scoring track; on a tie, `preferred` (Plex's pick) if it's in the list.
+  function bestAudio(candidates, preferred) {
+    const start = candidates.includes(preferred) ? preferred : candidates[0];
+    return candidates.reduce((best, s) => (audioScore(s) > audioScore(best) ? s : best), start);
+  }
+
+  // Worth a note: lossless over lossy, or more channels at the same kind. A slightly
+  // higher bitrate alone isn't.
+  function isClearlyBetter(a, b) {
+    if (a === b) return false;
+    if (isLossless(a) !== isLossless(b)) return isLossless(a);
+    return (a.channels ?? 0) > (b.channels ?? 0);
   }
 
   async function nextEpisode(server, ratingKey) {
@@ -375,13 +440,19 @@
     const resolution = { '4k': '4K', 1080: '1080p', 720: '720p', 480: '480p', sd: 'SD' }[media.videoResolution]
       ?? media.videoResolution ?? '';
     const video = [resolution, (media.videoCodec ?? '').toUpperCase()].filter(Boolean).join(' ');
-    const track = audioStream
-      ? { audioCodec: audioStream.codec, audioProfile: audioStream.profile, audioChannels: audioStream.channels }
-      : media;
-    const channels = { 8: '7.1', 7: '6.1', 6: '5.1', 2: '2.0', 1: 'mono' }[track.audioChannels] ?? '';
-    const audio = [audioName(track), channels].filter(Boolean).join(' ');
+    const audio = audioStream
+      ? audioLabel(audioStream)
+      : [audioName(media), CHANNELS[media.audioChannels]].filter(Boolean).join(' ');
     const rate = media.bitrate ? `${Math.round(media.bitrate / 1000)} Mbps` : '';
     return [video, audio, rate].filter(Boolean).join(' · ');
+  }
+
+  const CHANNELS = { 8: '7.1', 7: '6.1', 6: '5.1', 2: '2.0', 1: 'mono' };
+
+  // A Plex audio stream as "TrueHD 7.1".
+  function audioLabel(stream) {
+    const name = audioName({ audioCodec: stream.codec, audioProfile: stream.profile });
+    return [name, CHANNELS[stream.channels]].filter(Boolean).join(' ');
   }
 
   function audioName({ audioCodec: codec, audioProfile: profile }) {
@@ -395,7 +466,7 @@
   let toastEl = null;
   let toastTimer = 0;
 
-  function toast(text, { error = false, sticky = false } = {}) {
+  function toast(text, { error = false, sticky = false, long = false } = {}) {
     if (!toastEl) {
       toastEl = document.createElement('div');
       toastEl.setAttribute('role', 'status');
@@ -421,7 +492,7 @@
     toastEl.style.background = error ? '#5c1a1a' : '#1f2326';
     toastEl.style.opacity = '1';
     clearTimeout(toastTimer);
-    if (!sticky) toastTimer = setTimeout(hideToast, error ? 7000 : 4000);
+    if (!sticky) toastTimer = setTimeout(hideToast, error ? 7000 : long ? 9000 : 4000);
   }
 
   function hideToast() {
